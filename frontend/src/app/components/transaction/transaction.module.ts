@@ -69,7 +69,7 @@ export class TransactionRoutingModule { }
     GraphsModule,
     TxBowtieModule,
     TransactionExtrasModule,
-    TrackerBarModule
+    TrackerBarModule,
   ],
   declarations: [
     TransactionComponent,

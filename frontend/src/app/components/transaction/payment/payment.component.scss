@@ -122,6 +122,12 @@
 .settled {
   color: var(--green);
   opacity: 0.8;
+  display: flex;
+  gap: 2px;
+}
+
+.confs-count {
+  color: var(--transparent-fg);
 }
 
 .confs-cell {
@@ -243,7 +249,7 @@
   }
 }
 
-.etaDeepMempool {
+.eta-deep-mempool {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;

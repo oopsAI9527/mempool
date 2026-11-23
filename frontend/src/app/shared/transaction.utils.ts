@@ -2170,28 +2170,114 @@ function base58ToSpk(address: string, network: string): string | null {
   return null;
 }
 
-const LIQUID_UNCONFIDENTIAL_PREFIX: Record<string, string> = { lq: 'ex', tlq: 'tex', el: 'ert' };
+const LIQUID_UNCONFIDENTIAL_PREFIX: Record<string, string> = { lq: 'ex', tlq: 'tex' };
+const BLECH32_GENERATORS = [0x7d52fba40bd886n, 0x5e8dbf1a03950cn, 0x1c3a3c74072a18n, 0x385d72fa0e5139n, 0x7093e5a608865bn];
+const BLECH32_CONSTANT = 1n;
+const BLECH32M_CONSTANT = 0x455972a3350f7a1n;
+const BLECH32_CHECKSUM_WORDS = 12;
+const BLECH32_TOP_SHIFT = 55n;
+const BLECH32_LOW_MASK = (1n << BLECH32_TOP_SHIFT) - 1n;
+const BECH32_WORD_BITS = 5;
+const BECH32_WORD_MASK = (1 << BECH32_WORD_BITS) - 1;
+const WITNESS_PROGRAM_BYTES = [20, 32];
+const BLINDING_KEY_BYTES = 33;
+const BASE58_CHECKSUM_BYTES = 4;
+const CONFIDENTIAL_BASE58_BYTES = 59; // confidential prefix + version + 33-byte blinding key + 20-byte hash + checksum
+const MAX_CONFIDENTIAL_ADDRESS_LENGTH = 121;
 
 // Strips the blinding key from a confidential Liquid address; any other address is returned unchanged
 export function liquidUnconfidential(address: string): string {
+  if (address.length > MAX_CONFIDENTIAL_ADDRESS_LENGTH) {
+    return address;
+  }
   try {
-    const blech32 = address.match(/^(lq|tlq|el)1([qpzry9x8gf2tvdw0s3jn54khce6mua7l]+)$/);
+    const blech32 = address.match(/^(lq|tlq)1([qpzry9x8gf2tvdw0s3jn54khce6mua7l]+)$/);
     if (blech32) {
-      // shortcut: the 12-char blech32 checksum is not verified, a mistyped address just matches no output
-      const words = Array.from(blech32[2].slice(0, -12)).map(char => BECH32_ALPHABET.indexOf(char));
-      const program = fromWords(words.slice(1)).slice(33);
-      return bech32Encode(LIQUID_UNCONFIDENTIAL_PREFIX[blech32[1]], [words[0], ...toWords(program)], words[0] === 0 ? 'bech32' : 'bech32m');
+      return blech32ToUnconfidential(blech32[1], blech32[2]) ?? address;
     }
-    const decoded = base58Decode(address);
-    if (decoded.length === 59) { // confidential prefix + version + 33-byte blinding key + 20-byte hash + checksum
-      const payload = new Uint8Array([decoded[1], ...decoded.slice(35, 55)]);
-      const checksum = new Hash().update(new Hash().update(payload).digest()).digest().slice(0, 4);
-      return base58Encode(new Uint8Array([...payload, ...checksum]));
-    }
-  } catch (e) {
+    return confidentialBase58ToUnconfidential(address) ?? address;
+  } catch {
     // not a confidential address
+    return address;
+  }
+}
+
+function blech32ToUnconfidential(prefix: string, data: string): string | null {
+  const words = Array.from(data).map(char => BECH32_ALPHABET.indexOf(char));
+  const version = words[0];
+  if (blech32Polymod(prefix, words) !== (version === 0 ? BLECH32_CONSTANT : BLECH32M_CONSTANT)) {
+    return null;
+  }
+  const program = fromWords(words.slice(1, -BLECH32_CHECKSUM_WORDS)).slice(BLINDING_KEY_BYTES);
+  if (!WITNESS_PROGRAM_BYTES.includes(program.length)) {
+    return null;
+  }
+  return bech32Encode(LIQUID_UNCONFIDENTIAL_PREFIX[prefix], [version, ...toWords(program)], version === 0 ? 'bech32' : 'bech32m');
+}
+
+function blech32Polymod(prefix: string, words: number[]): bigint {
+  const prefixCodes = Array.from(prefix).map(char => char.charCodeAt(0));
+  const values = [...prefixCodes.map(code => code >> BECH32_WORD_BITS), 0, ...prefixCodes.map(code => code & BECH32_WORD_MASK), ...words];
+  let chk = 1n;
+  for (const value of values) {
+    const top = chk >> BLECH32_TOP_SHIFT;
+    chk = ((chk & BLECH32_LOW_MASK) << BigInt(BECH32_WORD_BITS)) ^ BigInt(value);
+    for (let i = 0; i < BLECH32_GENERATORS.length; i++) {
+      if ((top >> BigInt(i)) & 1n) {
+        chk ^= BLECH32_GENERATORS[i];
+      }
+    }
+  }
+  return chk;
+}
+
+function confidentialBase58ToUnconfidential(address: string): string | null {
+  const decoded = base58Decode(address);
+  if (decoded.length !== CONFIDENTIAL_BASE58_BYTES) {
+    return null;
+  }
+  const expectedChecksum = base58Checksum(decoded.slice(0, -BASE58_CHECKSUM_BYTES));
+  if (!decoded.slice(-BASE58_CHECKSUM_BYTES).every((byte, i) => byte === expectedChecksum[i])) {
+    return null;
+  }
+  const payload = new Uint8Array([decoded[1], ...decoded.slice(2 + BLINDING_KEY_BYTES, -BASE58_CHECKSUM_BYTES)]);
+  return base58Encode(new Uint8Array([...payload, ...base58Checksum(payload)]));
+}
+
+function base58Checksum(payload: Uint8Array): Uint8Array {
+  return new Hash().update(new Hash().update(payload).digest()).digest().slice(0, BASE58_CHECKSUM_BYTES);
+}
+
+export function normalizeAddressCase(address: string): string {
+  if (/^(?:[A-Z]{2,5}1[AC-HJ-NP-Z02-9]{8,117}|04[a-fA-F0-9]{128}|(?:02|03)[a-fA-F0-9]{64})$/.test(address)) {
+    return address.toLowerCase();
   }
   return address;
+}
+
+export function voutPaysAddress(vout: Vout | undefined, address: string): boolean {
+  if (!vout || !address) { // coinbase inputs have no prevout
+    return false;
+  }
+  if (vout.scriptpubkey_type === 'p2pk') { // strip out push and checksig opcodes
+    return vout.scriptpubkey.slice(2, -2) === address;
+  }
+  return vout.scriptpubkey_address === address;
+}
+
+export function netAmountForAddress(tx: Transaction, address: string): number {
+  let amount = 0;
+  for (const vout of tx?.vout || []) {
+    if (voutPaysAddress(vout, address)) {
+      amount += vout.value;
+    }
+  }
+  for (const vin of tx?.vin || []) {
+    if (voutPaysAddress(vin.prevout, address)) {
+      amount -= vin.prevout.value;
+    }
+  }
+  return amount;
 }
 
 // bech32 encoding / decoding

@@ -1,7 +1,7 @@
 import { Component, OnInit, OnDestroy, HostListener, ChangeDetectorRef, Inject } from '@angular/core';
 import { ElectrsApiService } from '@app/services/electrs-api.service';
-import { ActivatedRoute, NavigationExtras, ParamMap, Router } from '@angular/router';
-import { switchMap, filter, catchError, map, startWith, distinctUntilChanged, tap, retryWhen, mergeMap, delay } from 'rxjs/operators';
+import { ActivatedRoute, ParamMap, Router } from '@angular/router';
+import { switchMap, filter, catchError, map, startWith, distinctUntilChanged, tap, retryWhen, mergeMap, delay, repeat, take } from 'rxjs/operators';
 import { Transaction, Vout } from '@interfaces/electrs.interface';
 import { of, from, merge, Subscription, Observable, combineLatest, BehaviorSubject, Subject, throwError, timer, retry } from 'rxjs';
 import { StateService } from '@app/services/state.service';
@@ -10,13 +10,13 @@ import { CacheService } from '@app/services/cache.service';
 import { WebsocketService } from '@app/services/websocket.service';
 import { SeoService } from '@app/services/seo.service';
 import { seoDescriptionNetwork } from '@app/shared/common.utils';
-import { getUnacceleratedFeeRate, getTransactionFlags, liquidUnconfidential } from '@app/shared/transaction.utils';
+import { getUnacceleratedFeeRate, getTransactionFlags, liquidUnconfidential, netAmountForAddress, normalizeAddressCase, voutPaysAddress } from '@app/shared/transaction.utils';
 import { BlockExtended, MempoolPosition, Acceleration, AccelerationPosition, RbfTree, CpfpInfo, DifficultyAdjustment } from '@interfaces/node-api.interface';
 import { RelativeUrlPipe } from '@app/shared/pipes/relative-url/relative-url.pipe';
 import { ZONE_SERVICE } from '@app/injection-tokens';
 import { MiningService, MiningStats } from '@app/services/mining.service';
 import { ETA, EtaService } from '@app/services/eta.service';
-import { getRegex } from '@app/shared/regex.utils';
+import { getRegex, Network } from '@app/shared/regex.utils';
 import { TrackerStage } from '@components/tracker/tracker-bar.component';
 import { ApiService } from '@app/services/api.service';
 import { ServicesApiServices } from '@app/services/services-api.service';
@@ -26,6 +26,7 @@ import { Pool } from '@components/transaction/transaction.component';
 import { LiquidUnblinding } from '@components/transaction/liquid-ublinding';
 import { AssetsService } from '@app/services/assets.service';
 import { PriceService } from '@app/services/price.service';
+import { PartnerCodeService } from '@app/services/partner-code.service';
 import { environment } from '@environments/environment';
 
 const DEFAULT_CONFS = 6;
@@ -33,6 +34,15 @@ const LIQUID_DEFAULT_CONFS = 2;
 const MAX_CONFS = 1024;
 
 export type PaymentKind = 'received' | 'sent' | 'self-transfer';
+
+type AssetMinimal = [string | null, string, string, number];
+
+interface AssetDisplay {
+  ticker: string;
+  name: string;
+  divisor: number;
+  digitsInfo: string;
+}
 
 @Component({
   selector: 'app-payment',
@@ -74,13 +84,15 @@ export class PaymentComponent implements OnInit, OnDestroy {
   da$: Observable<DifficultyAdjustment>;
 
   destination = '';
-  matchAddress = '';
+  unconfidentialDestination = '';
   currencyChangeSubscription: Subscription;
+  assetsSubscription: Subscription;
   liquidUnblinding = new LiquidUnblinding();
-  errorUnblinded: any = undefined;
+  errorUnblinded: Error | undefined = undefined;
   nativeAssetId = this.stateService.network === 'liquidtestnet' ? environment.nativeTestAssetId : environment.nativeAssetId;
   asset: string | null = null;
-  assetsMinimal: any = {};
+  assetsMinimal: Record<string, AssetMinimal> = {};
+  assetDisplay: AssetDisplay | null = null;
   confsRequired = DEFAULT_CONFS;
   amount = 0;
   paymentKind: PaymentKind = 'received';
@@ -111,6 +123,10 @@ export class PaymentComponent implements OnInit, OnDestroy {
   fetchCachedTxSubscription: Subscription;
   txRbfInfoSubscription: Subscription;
   urlFragmentSubscription: Subscription;
+  partnerCodeSubscription: Subscription;
+  partnerCode: string | undefined;
+  transactionTimesSubscription: Subscription;
+  transactionTimes$ = new Subject<string>();
   latestReplacement: string;
   viewAmountMode$: Observable<'btc' | 'sats' | 'fiat'>;
 
@@ -139,6 +155,7 @@ export class PaymentComponent implements OnInit, OnDestroy {
     private storageService: StorageService,
     private assetsService: AssetsService,
     private priceService: PriceService,
+    private partnerCodeService: PartnerCodeService,
     private cd: ChangeDetectorRef,
     @Inject(ZONE_SERVICE) private zoneService: any,
   ) {}
@@ -165,6 +182,16 @@ export class PaymentComponent implements OnInit, OnDestroy {
     this.hideAccelerationSummary = this.stateService.isMempoolSpaceBuild ? this.storageService.getValue('hide-accelerator-pref') == 'true' : true;
 
     this.da$ = this.stateService.difficultyAdjustment$;
+
+    if (this.isLiquid) {
+      this.assetsSubscription = this.assetsService.getAssetsMinimalJson$.pipe(
+        catchError(() => of({})),
+      ).subscribe((assetsMinimal: Record<string, AssetMinimal>) => {
+        this.assetsMinimal = assetsMinimal;
+        this.updateAssetDisplay();
+        this.cd.markForCheck();
+      });
+    }
 
     this.fetchAccelerationSubscription = this.fetchAcceleration$.pipe(
       filter(() => this.stateService.env.ACCELERATOR === true),
@@ -302,42 +329,45 @@ export class PaymentComponent implements OnInit, OnDestroy {
       switchMap((txId) =>
         this.apiService
           .getRbfHistory$(txId)
+          .pipe(
+            catchError(() => {
+              return of(null);
+            })
+          )
       ),
-      catchError(() => {
-        return of(null);
-      })
     ).subscribe((rbfResponse) => {
       this.rbfChecked = true;
-      this.rbfInfo = rbfResponse?.replacements;
-      if (this.rbfInfo) {
-        // link to the latest pending version
-        this.latestReplacement = this.rbfInfo.tx.txid;
-        // or traverse the rbf tree to find a confirmed version
-        if (this.rbfInfo.mined) {
-          const stack = [this.rbfInfo];
-          let found = false;
-          while (stack.length && !found) {
-            const top = stack.pop();
-            if (top?.tx.mined) {
-              found = true;
-              this.latestReplacement = top.tx.txid;
-              break;
-            } else {
-              stack.push(...top.replaces);
-            }
-          }
-        }
-        if (!this.tx?.status?.confirmed && this.latestReplacement && this.latestReplacement !== this.txId) {
-          this.replaced = true;
-          this.trackerStage = 'replaced';
-        }
-      }
+      this.setRbfInfo(rbfResponse?.replacements);
       this.cd.markForCheck();
     });
 
     this.txRbfInfoSubscription = this.stateService.txRbfInfo$.subscribe((rbfInfo) => {
       if (this.tx) {
-        this.rbfInfo = rbfInfo;
+        this.setRbfInfo(rbfInfo);
+        this.cd.markForCheck();
+      }
+    });
+
+    this.partnerCodeSubscription = this.partnerCodeService.partnerCode$.subscribe((partnerCode) => {
+      this.partnerCode = partnerCode;
+    });
+
+    this.transactionTimesSubscription = this.transactionTimes$.pipe(
+      switchMap((txid) => this.apiService.getTransactionTimes$([txid]).pipe(
+        retry({ count: 2, delay: 2000 }),
+        // Try again until we either get a valid response, or the transaction is confirmed
+        repeat({ delay: 2000 }),
+        filter((transactionTimes) => transactionTimes?.[0] > 0 || this.tx?.txid !== txid || this.tx.status?.confirmed),
+        take(1),
+        map((transactionTimes) => this.tx?.txid === txid ? transactionTimes?.[0] : 0),
+        catchError(() => {
+          return of(0);
+        })
+      )),
+    ).subscribe((transactionTime) => {
+      if (transactionTime > 0) {
+        this.transactionTime = transactionTime;
+        this.cd.markForCheck();
       }
     });
 
@@ -349,10 +379,12 @@ export class PaymentComponent implements OnInit, OnDestroy {
       switchMap((txId) =>
         this.apiService
           .getRbfCachedTx$(txId)
+          .pipe(
+            catchError(() => {
+              return of(null);
+            })
+          )
       ),
-      catchError(() => {
-        return of(null);
-      })
     ).subscribe((tx) => {
       this.loadingCachedTx = false;
       if (!tx) {
@@ -430,7 +462,12 @@ export class PaymentComponent implements OnInit, OnDestroy {
               .getTransaction$(this.txId)
               .pipe(catchError(this.handleLoadElectrsTransactionError.bind(this)));
           }
-          return merge(transactionObservable$, this.stateService.mempoolTransactions$);
+          return merge(
+            transactionObservable$,
+            this.stateService.mempoolTransactions$.pipe(
+              filter((tx) => tx.txid?.toLowerCase() === this.txId?.toLowerCase())
+            )
+          );
         }),
         switchMap((tx) => {
           if (this.isLiquid) {
@@ -464,7 +501,7 @@ export class PaymentComponent implements OnInit, OnDestroy {
           if (tx.firstSeen) {
             this.transactionTime = tx.firstSeen;
           } else {
-            this.getTransactionTime();
+            this.transactionTimes$.next(tx.txid);
           }
         } else {
           this.trackerStage = 'confirmed';
@@ -532,7 +569,7 @@ export class PaymentComponent implements OnInit, OnDestroy {
 
       this.replaced = true;
       this.trackerStage = 'replaced';
-      if (rbfTx) {
+      if (rbfTx && !this.rbfInfo) {
         this.latestReplacement = rbfTx.txid;
       }
       this.stateService.markBlock$.next({});
@@ -575,7 +612,7 @@ export class PaymentComponent implements OnInit, OnDestroy {
           this.trackerStage = 'confirmed';
         } else if (eta?.blocks === 0) {
           this.trackerStage = 'next';
-        } else if (eta?.blocks != null && eta?.blocks < 3){
+        } else if (eta?.blocks != null && eta?.blocks < 3) {
           this.trackerStage = 'soon';
         } else {
           this.trackerStage = 'pending';
@@ -584,8 +621,59 @@ export class PaymentComponent implements OnInit, OnDestroy {
     );
 
     this.urlFragmentSubscription = this.route.fragment.subscribe((fragment) => {
+      this.consumePartnerCode(fragment);
       this.updateFragmentParams(fragment);
     });
+  }
+
+  private setRbfInfo(rbfInfo: RbfTree | undefined): void {
+    this.rbfInfo = rbfInfo;
+    if (!rbfInfo) {
+      return;
+    }
+    // link to the latest pending version
+    this.latestReplacement = rbfInfo.tx.txid;
+    // or traverse the rbf tree to find a confirmed version
+    if (rbfInfo.mined) {
+      const stack = [rbfInfo];
+      let found = false;
+      while (stack.length && !found) {
+        const top = stack.pop();
+        if (top?.tx.mined) {
+          found = true;
+          this.latestReplacement = top.tx.txid;
+          break;
+        } else {
+          stack.push(...top.replaces);
+        }
+      }
+    }
+    if (!this.tx?.status?.confirmed && this.latestReplacement && this.latestReplacement !== this.txId) {
+      this.replaced = true;
+      this.trackerStage = 'replaced';
+    }
+  }
+
+  private consumePartnerCode(fragment: string | null): void {
+    const params = new URLSearchParams(fragment ?? '');
+    if (!params.has('partnerCode')) {
+      return;
+    }
+    const partnerCode = params.get('partnerCode');
+    if (partnerCode) {
+      this.partnerCodeService.setFragmentPartnerCode(partnerCode);
+    }
+    params.delete('partnerCode');
+    this.router.navigate([], {
+      relativeTo: this.route,
+      fragment: this.formatFragment(params) || undefined,
+      queryParamsHandling: 'merge',
+      replaceUrl: true,
+    });
+  }
+
+  private formatFragment(params: URLSearchParams): string {
+    return Array.from(params.entries()).map(([key, value]) => value ? `${key}=${value}` : key).join('&');
   }
 
   private setTransaction(tx: Transaction, isCached: boolean): void {
@@ -602,37 +690,16 @@ export class PaymentComponent implements OnInit, OnDestroy {
   }
 
   private destinationMatches(vout?: Vout): boolean {
-    if (!vout) { // coinbase inputs have no prevout
-      return false;
-    }
-
-    if (vout.scriptpubkey_type !== 'p2pk') {
-      return vout.scriptpubkey_address === this.matchAddress;
-    }
-
-    const pushOpcode = this.matchAddress.length === 130 ? '41' : '21';
-    return vout.scriptpubkey === `${pushOpcode}${this.matchAddress}ac`;
+    return voutPaysAddress(vout, this.unconfidentialDestination);
   }
 
   private destinationIsAddress(): boolean {
-    const network = (this.network || 'mainnet') as any;
+    const network = (this.network || 'mainnet') as Network;
     return !!this.destination && getRegex('address', network).test(this.destination);
   }
 
   private destinationInOutputs(tx: Transaction): boolean {
     return !!tx?.vout?.some(vout => this.destinationMatches(vout));
-  }
-
-  private receivedBy(tx: Transaction): number {
-    return (tx?.vout || []).reduce((total, vout) => {
-      return this.destinationMatches(vout) ? total + vout.value : total;
-    }, 0);
-  }
-
-  private sentBy(tx: Transaction): number {
-    return (tx?.vin || []).reduce((total, { prevout }) => {
-      return this.destinationMatches(prevout) ? total + prevout.value : total;
-    }, 0);
   }
 
   private destinationInInputs(tx: Transaction): boolean {
@@ -660,41 +727,56 @@ export class PaymentComponent implements OnInit, OnDestroy {
   }
 
   isValidDestination(tx: Transaction): boolean {
-    return this.destinationIsAddress()
-      && this.destinationAssets(tx).length <= 1
-      && (this.destinationValueUnknown(tx) || this.receivedBy(tx) !== this.sentBy(tx));
+    if (!this.destinationIsAddress() || this.destinationAssets(tx).length > 1) {
+      return false;
+    }
+    if (this.destinationValueUnknown(tx)) {
+      return !(this.destinationInInputs(tx) && this.destinationInOutputs(tx));
+    }
+    return netAmountForAddress(tx, this.unconfidentialDestination) !== 0;
   }
 
   setAmount(): void {
-    this.amount = this.destinationValueUnknown(this.tx) ? null : this.receivedBy(this.tx) - this.sentBy(this.tx);
+    this.amount = this.destinationValueUnknown(this.tx) ? null : netAmountForAddress(this.tx, this.unconfidentialDestination);
     this.paymentKind = this.getPaymentKind();
     this.asset = this.destinationAssets(this.tx)[0] ?? null;
-    if (this.asset && this.asset !== this.nativeAssetId) {
-      this.assetsService.getLiquidAssetsMinimalData([this.tx]).then((assets) => {
-        this.assetsMinimal = assets;
-      });
-    }
+    this.updateAssetDisplay();
   }
 
-  pow(base: number, exponent: number): number {
-    return Math.pow(base, exponent);
+  private updateAssetDisplay(): void {
+    const assetMinimal = this.asset ? this.assetsMinimal[this.asset] : undefined;
+    if (!assetMinimal) {
+      this.assetDisplay = null;
+      return;
+    }
+    const [, ticker, name, precision] = assetMinimal;
+    this.assetDisplay = {
+      ticker,
+      name,
+      divisor: Math.pow(10, precision),
+      digitsInfo: `1.${precision}-${precision}`,
+    };
   }
 
   private getPaymentKind(): PaymentKind {
     if (!this.destinationInInputs(this.tx)) {
       return 'received';
     }
-    if (this.tx?.vout?.length && this.tx.vout.every(vout => vout.scriptpubkey_type === 'fee' || this.destinationMatches(vout))) {
+    const spendsOnlyDestination = this.tx.vin.every(vin => this.destinationMatches(vin.prevout));
+    const paysOnlyDestination = !!this.tx.vout?.length && this.tx.vout.every(vout => vout.scriptpubkey_type === 'fee' || this.destinationMatches(vout));
+    if (spendsOnlyDestination && paysOnlyDestination) {
       return 'self-transfer';
     }
     return this.amount > 0 ? 'received' : 'sent';
   }
 
   updateConfirmations(): void {
-    if (this.tx?.status?.confirmed && this.latestBlock?.height != null) {
+    if (!this.tx?.status?.confirmed) {
+      this.confirmations = 0;
+    } else if (this.latestBlock?.height != null) {
       this.confirmations = Math.max(1, this.latestBlock.height - this.tx.status.block_height + 1);
     } else {
-      this.confirmations = 0;
+      this.confirmations = 1;
     }
     this.settled = this.confirmations >= this.confsRequired;
   }
@@ -703,8 +785,8 @@ export class PaymentComponent implements OnInit, OnDestroy {
     const params = new URLSearchParams(fragment ?? '');
 
     if (params.has('destination')) {
-      this.destination = this.formatAddress(params.get('destination') || '');
-      this.matchAddress = this.isLiquid ? liquidUnconfidential(this.destination) : this.destination;
+      this.destination = normalizeAddressCase(params.get('destination') || '');
+      this.unconfidentialDestination = this.isLiquid && this.destinationIsAddress() ? liquidUnconfidential(this.destination) : this.destination;
     }
 
     if (params.has('confs')) {
@@ -720,7 +802,7 @@ export class PaymentComponent implements OnInit, OnDestroy {
 
     this.forceAccelerationSummary = params.has('accelerate');
 
-    if (this.tx) {
+    if (this.tx && this.route.snapshot.paramMap.get('id') === this.txId) {
       this.applyDestination();
     }
   }
@@ -764,7 +846,7 @@ export class PaymentComponent implements OnInit, OnDestroy {
       queryParams: {
         mode: 'details',
       },
-      fragment: this.detailsFragment().toString() || undefined,
+      fragment: this.formatFragment(this.detailsFragment()) || undefined,
     });
   }
 
@@ -772,13 +854,13 @@ export class PaymentComponent implements OnInit, OnDestroy {
     const baseRoute = [this.relativeUrlPipe.transform('/tx'), this.txId];
     const fragment = this.detailsFragment();
     if (this.tx && this.destinationIsAddress() && !this.destinationInOutputs(this.tx)) {
-      fragment.set('destinationAlert', this.matchAddress);
+      fragment.set('destinationAlert', this.unconfidentialDestination);
     }
     this.router.navigate(baseRoute, {
       queryParams: {
         mode: 'details',
       },
-      fragment: fragment.toString() || undefined,
+      fragment: this.formatFragment(fragment) || undefined,
       replaceUrl: true,
     });
   }
@@ -791,16 +873,6 @@ export class PaymentComponent implements OnInit, OnDestroy {
     return params;
   }
 
-  getTransactionTime(): void {
-    this.apiService
-      .getTransactionTimes$([this.tx.txid])
-      .subscribe((transactionTimes) => {
-        if (transactionTimes?.length) {
-          this.transactionTime = transactionTimes[0];
-        }
-      });
-  }
-
   handleLoadElectrsTransactionError(error: any): Observable<any> {
     if (error.status === 404 && /^[a-fA-F0-9]{64}$/.test(this.txId)) {
       this.websocketService.startMultiTrackTransaction(this.txId);
@@ -810,14 +882,6 @@ export class PaymentComponent implements OnInit, OnDestroy {
     this.seoService.logSoft404();
     this.isLoadingTx = false;
     return of(false);
-  }
-
-  private formatAddress(address: string) {
-    let formattedAddress = address;
-    if (/^[A-Z]{2,5}1[AC-HJ-NP-Z02-9]{8,100}|04[a-fA-F0-9]{128}|(02|03)[a-fA-F0-9]{64}$/.test(formattedAddress)) {
-      formattedAddress = formattedAddress.toLowerCase();
-    }
-    return formattedAddress;
   }
 
   resetTransaction(): void {
@@ -837,6 +901,7 @@ export class PaymentComponent implements OnInit, OnDestroy {
     this.trackerStage = 'waiting';
     this.amount = 0;
     this.asset = null;
+    this.assetDisplay = null;
     this.errorUnblinded = undefined;
     this.paymentKind = 'received';
     this.confirmations = 0;
@@ -879,7 +944,10 @@ export class PaymentComponent implements OnInit, OnDestroy {
     this.txReplacedSubscription?.unsubscribe();
     this.urlFragmentSubscription?.unsubscribe();
     this.currencyChangeSubscription?.unsubscribe();
+    this.assetsSubscription?.unsubscribe();
     this.txRbfInfoSubscription?.unsubscribe();
+    this.partnerCodeSubscription?.unsubscribe();
+    this.transactionTimesSubscription?.unsubscribe();
     this.fetchCpfpSubscription?.unsubscribe();
     this.fetchAccelerationSubscription?.unsubscribe();
     this.miningSubscription?.unsubscribe();
@@ -919,12 +987,10 @@ export class PaymentComponent implements OnInit, OnDestroy {
     return this.isLiquid ? LIQUID_DEFAULT_CONFS : DEFAULT_CONFS;
   }
 
-  onAccelerateClicked() {
-    if (!this.txId) {
-      return;
+  onAccelerateClicked(): boolean {
+    if (this.txId) {
+      this.openAccelerator();
     }
-
-    this.openAccelerator();
     return false;
   }
 
@@ -979,10 +1045,10 @@ export class PaymentComponent implements OnInit, OnDestroy {
       params.set(anchor, '');
     }
 
-    return Array.from(params.entries()).map(([key, value]) => value ? `${key}=${value}` : key).join('&');
+    return this.formatFragment(params);
   }
 
-  setIsAccelerated(initialState: boolean = false) {
+  setIsAccelerated(initialState: boolean = false): void {
     this.isAcceleration =
       (
         (this.tx.acceleration && (!this.tx.status.confirmed || this.waitingForAccelerationInfo)) ||
@@ -1008,7 +1074,6 @@ export class PaymentComponent implements OnInit, OnDestroy {
       return;
     }
     const firstCpfp = this.cpfpInfo == null;
-    // merge ancestors/descendants
     const relatives = [...(cpfpInfo.ancestors || []), ...(cpfpInfo.descendants || [])];
     if (cpfpInfo.bestDescendant && !cpfpInfo.descendants?.length) {
       relatives.push(cpfpInfo.bestDescendant);

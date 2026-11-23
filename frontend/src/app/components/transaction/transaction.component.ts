@@ -27,7 +27,7 @@ import { ApiService } from '@app/services/api.service';
 import { SeoService } from '@app/services/seo.service';
 import { StorageService } from '@app/services/storage.service';
 import { seoDescriptionNetwork, isMobile } from '@app/shared/common.utils';
-import { getTransactionFlags, getUnacceleratedFeeRate } from '@app/shared/transaction.utils';
+import { getTransactionFlags, getUnacceleratedFeeRate, liquidUnconfidential, normalizeAddressCase, voutPaysAddress } from '@app/shared/transaction.utils';
 import { Filter, TransactionFlags, toFilters } from '@app/shared/filters.utils';
 import { BlockExtended, CpfpInfo, RbfTree, MempoolPosition, DifficultyAdjustment, Acceleration, AccelerationPosition } from '@interfaces/node-api.interface';
 import { LiquidUnblinding } from '@components/transaction/liquid-ublinding';
@@ -40,7 +40,7 @@ import { ZONE_SERVICE } from '@app/injection-tokens';
 import { MiningService, MiningStats } from '@app/services/mining.service';
 import { ETA, EtaService } from '@app/services/eta.service';
 import { AnalyticsService } from '@app/services/analytics.service';
-import { getRegex } from '@app/shared/regex.utils';
+import { getRegex, Network } from '@app/shared/regex.utils';
 
 export interface Pool {
   id: number;
@@ -102,6 +102,7 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
   mempoolPositionSubscription: Subscription;
   queryParamsSubscription: Subscription;
   urlFragmentSubscription: Subscription;
+  destinationAlertSubscription: Subscription;
   mempoolBlocksSubscription: Subscription;
   blocksSubscription: Subscription;
   miningSubscription: Subscription;
@@ -279,6 +280,14 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
       this.updateFragmentParams(fragment);
     });
 
+    this.destinationAlertSubscription = combineLatest([
+      this.txChanged$,
+      this.route.fragment,
+    ]).subscribe(([, fragment]) => {
+      this.updateDestinationAlert(fragment);
+      this.cd.markForCheck();
+    });
+
     this.blocksSubscription = this.stateService.blocks$.subscribe((blocks) => {
       this.latestBlock = blocks[0];
     });
@@ -386,7 +395,6 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
           }
         });
         this.txChanged$.next(true);
-        this.showDestinationAlert();
       }
     });
 
@@ -761,8 +769,6 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
             })
           ).subscribe();
 
-          this.showDestinationAlert();
-
           this.cd.detectChanges();
         },
         (error) => {
@@ -1123,7 +1129,6 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
     this.isAccelerated$.next(this.isAcceleration);
     this.eligibleForAcceleration = false;
     this.leaveTransaction();
-    this.showDestinationAlert();
   }
 
   leaveTransaction() {
@@ -1246,7 +1251,6 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
         this.firstFragmentScroll = false;
       }
     }
-    this.showDestinationAlert(this.fragmentParams);
   }
 
   setHasAccelerationDetails(hasDetails: boolean): void {
@@ -1294,8 +1298,7 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
 
   closeDestinationAlert(): void {
     this.fragmentParams.delete('destinationAlert');
-    this.router.navigate([], { fragment: this.formatFragment(this.fragmentParams), queryParamsHandling: 'merge'});
-    this.destinationAlert = undefined;
+    this.router.navigate([], { fragment: this.formatFragment(this.fragmentParams), queryParamsHandling: 'merge' });
   }
 
   get showAccelerationSummary(): boolean {
@@ -1326,6 +1329,7 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
     this.queryParamsSubscription.unsubscribe();
     this.flowPrefSubscription.unsubscribe();
     this.urlFragmentSubscription.unsubscribe();
+    this.destinationAlertSubscription.unsubscribe();
     this.mempoolBlocksSubscription.unsubscribe();
     this.mempoolPositionSubscription.unsubscribe();
     this.blocksSubscription.unsubscribe();
@@ -1344,28 +1348,14 @@ export class TransactionComponent implements OnInit, AfterViewInit, OnDestroy {
     });
   }
 
-  showDestinationAlert(fragment: URLSearchParams = new URLSearchParams(this.route.snapshot.fragment)): void {
-    if (!this.tx) {
+  private updateDestinationAlert(fragment: string | null): void {
+    const address = normalizeAddressCase(new URLSearchParams(fragment || '').get('destinationAlert') || '');
+    if (!this.tx || !getRegex('address', (this.network || 'mainnet') as Network).test(address)) {
       this.destinationAlert = undefined;
       return;
     }
-    let destinationAlert = new URLSearchParams(fragment).get('destinationAlert') || '';
-    const isAddress = getRegex('address', (this.network || 'mainnet') as any).test(destinationAlert);
-    if (/^[A-Z]{2,5}1[AC-HJ-NP-Z02-9]{8,100}|04[a-fA-F0-9]{128}|(02|03)[a-fA-F0-9]{64}$/.test(destinationAlert)) {
-      destinationAlert = destinationAlert.toLowerCase();
-    }
-    if (isAddress && !this.tx.vout?.some((vout) => {
-      let address: string = vout.scriptpubkey_address ?? vout.scriptpubkey;
-      if (vout.scriptpubkey_type === 'p2pk') { // strip out push and checksig opcodes
-        address = address.slice(2, -2);
-      }
-      return address === destinationAlert;
-    })) {
-      this.fragmentParams.set('destinationAlert', destinationAlert);
-      this.destinationAlert = destinationAlert;
-    } else {
-      this.fragmentParams.delete('destinationAlert');
-      this.destinationAlert = undefined;
-    }
+    const unconfidentialAddress = this.isLiquid ? liquidUnconfidential(address) : address;
+    const isPaid = !!this.tx.vout?.some(vout => voutPaysAddress(vout, unconfidentialAddress));
+    this.destinationAlert = isPaid ? undefined : address;
   }
 }
