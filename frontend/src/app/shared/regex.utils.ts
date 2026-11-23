@@ -119,7 +119,7 @@ const ADDRESS_CHARS: {
           + `lq1`
         + `)`
         + BECH32_CHARS_LW // blech32 and bech32 are the same alphabet and protocol, different checksums.
-        + `{6,100}`
+        + `{6,117}`
       + `|`
         + `(?:` // Same as above but all upper case
           + `EX1`
@@ -127,21 +127,25 @@ const ADDRESS_CHARS: {
           + `LQ1`
         + `)`
         + BECH32_CHARS_UP
-        + `{6,100}`
+        + `{6,117}`
       + `)`,
   },
   liquidtestnet: {
-    base58: `[89]` // ???(TODO: find version) is P2PKH, 8|9 is P2SH
-      + BASE58_CHARS
-      + `{33}`, // P2PKH is ???(TODO: find size), P2SH is 34
+    base58: `[F89]` // F is P2PKH, 8|9 is P2SH
+        + BASE58_CHARS
+        + `{33}` // All min-max lengths are 34
+      + `|`
+        + `[v][tj]` // Confidential P2PKH or P2SH starts with vt or vj
+        + BASE58_CHARS
+        + `{78}`,
     bech32: `(?:`
-        + `(?:` // bech32 liquid testnet starts with tex or tlq
-          + `tex1` // TODO: Why does mempool use this and not ert|el like in the elements source?
+        + `(?:` // bech32 liquid testnet starts with tex1 (unconfidential) or tlq1 (confidential); ert1|el1 are Elements regtest
+          + `tex1`
           + `|`
-          + `tlq1` // TODO: does this exist?
+          + `tlq1`
         + `)`
         + BECH32_CHARS_LW // blech32 and bech32 are the same alphabet and protocol, different checksums.
-        + `{6,100}`
+        + `{6,117}`
       + `|`
         + `(?:` // Same as above but all upper case
           + `TEX1`
@@ -149,7 +153,7 @@ const ADDRESS_CHARS: {
           + `TLQ1`
         + `)`
         + BECH32_CHARS_UP
-        + `{6,100}`
+        + `{6,117}`
       + `)`,
   },
 };
